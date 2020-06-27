@@ -86,8 +86,8 @@ np.random.seed(args.seed)
 if not os.path.exists(args.log_dir):
     os.makedirs(args.log_dir)
 
-if args.cuda:
-    cudnn.benchmark = True
+# if args.cuda:
+#     cudnn.benchmark = True
 
 LOG_DIR = args.log_dir + '/run-optim_{}-n{}-lr{}-wd{}-m{}-embeddings{}-msceleb-alpha10'\
     .format(args.optimizer, args.n_triplets, args.lr, args.wd,
@@ -145,7 +145,7 @@ class Scale(object):
             return img.resize(self.size, self.interpolation)
 
 
-kwargs = {'num_workers': 2, 'pin_memory': True} if args.cuda else {}
+kwargs = {'num_workers': 2, 'pin_memory': True}
 l2_dist = PairwiseDistance(2)
 
 transform = transforms.Compose([
@@ -184,7 +184,7 @@ def main():
                       pretrained=False)
 
     model.to(device)
-    triplet_loss = TripletMarginLoss(args.margin).to(device)
+    triplet_loss = TripletMarginLoss(args.margin)
     optimizer = create_optimizer(model, args.lr)
 
     # optionally resume from a checkpoint
@@ -203,7 +203,7 @@ def main():
 
     for epoch in range(start, end):
         print(80 * '=')
-        print('Epoch [{}/{}]', epoch, end - 1)
+        print('Epoch [{}/{}]'.format(epoch, end - 1))
         time0 = time.time()
         own_train(train_loader, model, triplet_loss, optimizer, epoch, data_size)
         own_test(test_loader, model, epoch)
@@ -237,9 +237,9 @@ def own_train(train_loader, model, triploss, optimizer, epoch, data_size):
             pos_hard_img = pos_img[hard_triplets]
             neg_hard_img = neg_img[hard_triplets]
 
-            model.module.forward_classfier(anc_hard_img)
-            model.module.forward_classfier(pos_hard_img)
-            model.module.forward_classfier(neg_hard_img)
+            model.forward_classifier(anc_hard_img)
+            model.forward_classifier(pos_hard_img)
+            model.forward_classifier(neg_hard_img)
 
             triplet_loss = triploss.forward(anc_hard_embed, pos_hard_embed, neg_hard_embed)
             logger.log_value('triplet_loss', triplet_loss)
@@ -278,7 +278,7 @@ def own_test(test_loader, model, epoch):
     for batch_idx, (data_a, data_p, label) in enumerate(test_loader):
         data_a, data_p = data_a.to(device), data_p.to(device)
         # compute output
-        with torch.no_grad(True):
+        with torch.no_grad():
             out_a, out_p = model(data_a), model(data_p)
             dists = l2_dist.forward(out_a,out_p)#torch.sqrt(torch.sum((out_a - out_p) ** 2, 1))  # euclidean distance
             distances.append(dists.data.cpu().numpy())
