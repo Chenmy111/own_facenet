@@ -206,13 +206,19 @@ def main():
         print('Epoch [{}/{}]'.format(epoch, end - 1))
         time0 = time.time()
         own_train(train_loader, model, triplet_loss, optimizer, epoch, data_size)
-        own_test(test_loader, model, epoch)
         print(f' Execution time    = {time.time() - time0}')
         print(80 * '=')
 
         if test_display_triplet_distance:
             display_triplet_distance(model,train_loader,LOG_DIR+"/train_{}".format(epoch))
-            display_triplet_distance_test(model,test_loader,LOG_DIR+"/test_{}".format(epoch))
+    print(80 * '=')
+    time0 = time.time()
+    own_test(test_loader, model, epoch)
+    print(f' Execution time    = {time.time() - time0}')
+    print(80 * '=')
+    if test_display_triplet_distance:
+        display_triplet_distance_test(model, test_loader, LOG_DIR + "/test_{}".format(epoch))
+
 
 def own_train(train_loader, model, triploss, optimizer, epoch, data_size):
     model.train()
