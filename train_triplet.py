@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
+import time
 
 from torch.autograd import Variable
 from torch.autograd import Function
@@ -79,7 +80,7 @@ args = parser.parse_args()
 # order to prevent any memory allocation on unused GPUs
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
 
-args.cuda = not args.no_cuda and torch.cuda.is_available()
+# args.cuda = not args.no_cuda and torch.cuda.is_available()
 np.random.seed(args.seed)
 
 if not os.path.exists(args.log_dir):
@@ -158,10 +159,12 @@ train_dir = TripletFaceDataset(dir=args.dataroot,n_triplets=args.n_triplets,tran
 train_loader = torch.utils.data.DataLoader(train_dir,
     batch_size=args.batch_size, shuffle=False, **kwargs)
 
-test_loader = torch.utils.data.DataLoader(
-    LFWDataset(dir=args.lfw_dir,pairs_path=args.lfw_pairs_path,
-                     transform=transform),
+test_dir = LFWDataset(dir=args.lfw_dir,pairs_path=args.lfw_pairs_path,transform=transform)
+test_loader = torch.utils.data.DataLoader(test_dir,
     batch_size=args.batch_size, shuffle=False, **kwargs)
+data_size = dict()
+data_size['train'] = len(train_dir)
+data_size['test'] = len(test_dir)
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -181,7 +184,7 @@ def main():
                       pretrained=False)
 
     model.to(device)
-
+    triplet_loss = TripletMarginLoss(args.margin).to(device)
     optimizer = create_optimizer(model, args.lr)
 
     # optionally resume from a checkpoint
@@ -199,130 +202,213 @@ def main():
     end = start + args.epochs
 
     for epoch in range(start, end):
-        train(train_loader, model, optimizer, epoch)
-        test(test_loader, model, epoch)
+        print(80 * '=')
+        print('Epoch [{}/{}]', epoch, end - 1)
+        time0 = time.time()
+        own_train(train_loader, model, triplet_loss, optimizer, epoch, data_size)
+        own_test(test_loader, model, epoch)
+        print(f' Execution time    = {time.time() - time0}')
+        print(80 * '=')
 
         if test_display_triplet_distance:
             display_triplet_distance(model,train_loader,LOG_DIR+"/train_{}".format(epoch))
             display_triplet_distance_test(model,test_loader,LOG_DIR+"/test_{}".format(epoch))
 
-
-def train(train_loader, model, optimizer, epoch):
-    # switch to train mode
+def own_train(train_loader, model, triploss, optimizer, epoch, data_size):
     model.train()
-
-    pbar = tqdm(enumerate(train_loader))
     labels, distances = [], []
+    triplet_loss_sum = 0.0
 
+    for batch_idx, (data_a, data_p, data_n, label_p, label_n) in enumerate(train_loader):
+        anc_img, pos_img, neg_img = data_a.to(device), data_p.to(device), data_n.to(device)
+        with torch.set_grad_enabled(True):
+            anc_embed, pos_embed, neg_embed = model(anc_img), model(pos_img), model(neg_img)
+            pos_dist = l2_dist.forward(anc_embed, pos_embed)
+            neg_dist = l2_dist.forward(anc_embed, neg_embed)
+            all = (neg_dist - pos_dist < args.margin).cpu().numpy().flatten()
+            hard_triplets = np.where(all == 1)
+            if len(hard_triplets) == 0:
+                continue
+            anc_hard_embed = anc_embed[hard_triplets]
+            pos_hard_embed = pos_embed[hard_triplets]
+            neg_hard_embed = neg_embed[hard_triplets]
 
-    for batch_idx, (data_a, data_p, data_n,label_p,label_n) in pbar:
+            anc_hard_img = anc_img[hard_triplets]
+            pos_hard_img = pos_img[hard_triplets]
+            neg_hard_img = neg_img[hard_triplets]
 
-        data_a, data_p, data_n = data_a.to(device), data_p.to(device), data_n.to(device)
-        # compute output
-        out_a, out_p, out_n = model(data_a), model(data_p), model(data_n)
+            model.module.forward_classfier(anc_hard_img)
+            model.module.forward_classfier(pos_hard_img)
+            model.module.forward_classfier(neg_hard_img)
 
-        # Choose the hard negatives
-        d_p = l2_dist.forward(out_a, out_p)
-        d_n = l2_dist.forward(out_a, out_n)
-        all = (d_n - d_p < args.margin).cpu().data.numpy().flatten()
-        hard_triplets = np.where(all == 1)
-        if len(hard_triplets[0]) == 0:
-            continue
-        out_selected_a = torch.from_numpy(out_a.cpu().data.numpy()[hard_triplets]).to(device)
-        out_selected_p = torch.from_numpy(out_p.cpu().data.numpy()[hard_triplets]).to(device)
-        out_selected_n = torch.from_numpy(out_n.cpu().data.numpy()[hard_triplets]).to(device)
+            triplet_loss = triploss.forward(anc_hard_embed, pos_hard_embed, neg_hard_embed)
+            logger.log_value('triplet_loss', triplet_loss)
+            optimizer.zero_grad()
+            triplet_loss.backward()
+            optimizer.step()
 
-        selected_data_a = torch.from_numpy(data_a.cpu().data.numpy()[hard_triplets]).to(device)
-        selected_data_p = torch.from_numpy(data_p.cpu().data.numpy()[hard_triplets]).to(device)
-        selected_data_n = torch.from_numpy(data_n.cpu().data.numpy()[hard_triplets]).to(device)
+            adjust_learning_rate(optimizer)
 
-        selected_label_p = torch.from_numpy(label_p.cpu().numpy()[hard_triplets])
-        selected_label_n= torch.from_numpy(label_n.cpu().numpy()[hard_triplets])
-        triplet_loss = TripletMarginLoss(args.margin).forward(out_selected_a, out_selected_p, out_selected_n)
+            distances.append(pos_dist.data.cpu().numpy())
+            labels.append(np.ones(pos_dist.size(0)))
 
-        cls_a = model.forward_classifier(selected_data_a)
-        cls_p = model.forward_classifier(selected_data_p)
-        cls_n = model.forward_classifier(selected_data_n)
+            distances.append(neg_dist.data.cpu().numpy())
+            labels.append(np.zeros(neg_dist.size(0)))
 
-        criterion = nn.CrossEntropyLoss()
-        predicted_labels = torch.cat([cls_a,cls_p,cls_n])
-        true_labels = torch.cat([selected_label_p.to(device),selected_label_p.to(device),selected_label_n.to(device)])
+            triplet_loss_sum += triplet_loss.item()
 
-        cross_entropy_loss = criterion(predicted_labels.to(device),true_labels.to(device))
-
-        loss = cross_entropy_loss + triplet_loss
-        # compute gradient and update weights
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # update the optimizer learning rate
-        adjust_learning_rate(optimizer)
-
-        # log loss value
-        logger.log_value('triplet_loss', triplet_loss.data).step()
-        logger.log_value('cross_entropy_loss', cross_entropy_loss.data).step()
-        logger.log_value('total_loss', loss.data).step()
-        if batch_idx % args.log_interval == 0:
-            pbar.set_description(
-                'Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f} \t # of Selected Triplets: {}'.format(
-                    epoch, batch_idx * len(data_a), len(train_loader.dataset),
-                    100. * batch_idx / len(train_loader),
-                    loss.data,len(hard_triplets[0])))
-
-
-        dists = l2_dist.forward(out_selected_a,out_selected_n) #torch.sqrt(torch.sum((out_a - out_n) ** 2, 1))  # euclidean distance
-        distances.append(dists.data.cpu().numpy())
-        labels.append(np.zeros(dists.size(0)))
-
-
-        dists = l2_dist.forward(out_selected_a,out_selected_p)#torch.sqrt(torch.sum((out_a - out_p) ** 2, 1))  # euclidean distance
-        distances.append(dists.data.cpu().numpy())
-        labels.append(np.ones(dists.size(0)))
-
+    avg_triplet_loss = triplet_loss_sum / data_size['train']
     labels = np.array([sublabel for label in labels for sublabel in label])
     distances = np.array([subdist for dist in distances for subdist in dist])
 
-    tpr, fpr, accuracy, val, val_std, far = evaluate(distances,labels)
-    print('\33[91mTrain set: Accuracy: {:.8f}\n\33[0m'.format(np.mean(accuracy)))
+    tpr, fpr, accuracy, val, val_std, far = evaluate(distances, labels)
+
+    print(' {} set - Triplet Loss   = {:.8f}'.format('train', avg_triplet_loss))
+    print(' {} set - Accuracy       = {:.8f}'.format('train', np.mean(accuracy)))
     logger.log_value('Train Accuracy', np.mean(accuracy))
-
-    plot_roc(fpr,tpr,figure_name="roc_train_epoch_{}.png".format(epoch))
-
-    # do checkpointing
+    plot_roc(fpr, tpr, figure_name="roc_train_epoch_{}.png".format(epoch))
     torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict()},
                '{}/checkpoint_{}.pth'.format(LOG_DIR, epoch))
 
-
-def test(test_loader, model, epoch):
+def own_test(test_loader, model, epoch):
     # switch to evaluate mode
     model.eval()
 
     labels, distances = [], []
-
-    pbar = tqdm(enumerate(test_loader))
-    for batch_idx, (data_a, data_p, label) in pbar:
-        if args.cuda:
-            data_a, data_p = data_a.to(device), data_p.to(device)
+    for batch_idx, (data_a, data_p, label) in enumerate(test_loader):
+        data_a, data_p = data_a.to(device), data_p.to(device)
         # compute output
-        out_a, out_p = model(data_a), model(data_p)
-        dists = l2_dist.forward(out_a,out_p)#torch.sqrt(torch.sum((out_a - out_p) ** 2, 1))  # euclidean distance
-        distances.append(dists.data.cpu().numpy())
-        labels.append(label.data.cpu().numpy())
-
-        if batch_idx % args.log_interval == 0:
-            pbar.set_description('Test Epoch: {} [{}/{} ({:.0f}%)]'.format(
-                epoch, batch_idx * len(data_a), len(test_loader.dataset),
-                100. * batch_idx / len(test_loader)))
+        with torch.no_grad(True):
+            out_a, out_p = model(data_a), model(data_p)
+            dists = l2_dist.forward(out_a,out_p)#torch.sqrt(torch.sum((out_a - out_p) ** 2, 1))  # euclidean distance
+            distances.append(dists.data.cpu().numpy())
+            labels.append(label.data.cpu().numpy())
 
     labels = np.array([sublabel for label in labels for sublabel in label])
     distances = np.array([subdist for dist in distances for subdist in dist])
 
     tpr, fpr, accuracy, val, val_std, far = evaluate(distances,labels, nrof_folds=3)
-    print('\33[91mTest set: Accuracy: {:.8f}\n\33[0m'.format(np.mean(accuracy)))
-    logger.log_value('Test Accuracy', np.mean(accuracy))
 
+    print(' {} set - Accuracy       = {:.8f}'.format('Test', np.mean(accuracy)))
+    logger.log_value('Test Accuracy', np.mean(accuracy))
     plot_roc(fpr,tpr,figure_name="roc_test_epoch_{}.png".format(epoch))
+
+# def test(test_loader, model, epoch):
+#     # switch to evaluate mode
+#     model.eval()
+#
+#     labels, distances = [], []
+#
+#     pbar = tqdm(enumerate(test_loader))
+#     for batch_idx, (data_a, data_p, label) in pbar:
+#         if args.cuda:
+#             data_a, data_p = data_a.to(device), data_p.to(device)
+#         # compute output
+#         out_a, out_p = model(data_a), model(data_p)
+#         dists = l2_dist.forward(out_a,out_p)#torch.sqrt(torch.sum((out_a - out_p) ** 2, 1))  # euclidean distance
+#         distances.append(dists.data.cpu().numpy())
+#         labels.append(label.data.cpu().numpy())
+#
+#         if batch_idx % args.log_interval == 0:
+#             pbar.set_description('Test Epoch: {} [{}/{} ({:.0f}%)]'.format(
+#                 epoch, batch_idx * len(data_a), len(test_loader.dataset),
+#                 100. * batch_idx / len(test_loader)))
+#
+#     labels = np.array([sublabel for label in labels for sublabel in label])
+#     distances = np.array([subdist for dist in distances for subdist in dist])
+#
+#     tpr, fpr, accuracy, val, val_std, far = evaluate(distances,labels, nrof_folds=3)
+#     print('\33[91mTest set: Accuracy: {:.8f}\n\33[0m'.format(np.mean(accuracy)))
+#     logger.log_value('Test Accuracy', np.mean(accuracy))
+#
+#     plot_roc(fpr,tpr,figure_name="roc_test_epoch_{}.png".format(epoch))
+
+
+# def train(train_loader, model, optimizer, epoch):
+#     # switch to train mode
+#     model.train()
+#
+#     pbar = tqdm(enumerate(train_loader))
+#     labels, distances = [], []
+#
+#
+#     for batch_idx, (data_a, data_p, data_n,label_p,label_n) in pbar:
+#
+#         data_a, data_p, data_n = data_a.to(device), data_p.to(device), data_n.to(device)
+#         # compute output
+#         out_a, out_p, out_n = model(data_a), model(data_p), model(data_n)
+#
+#         # Choose the hard negatives
+#         d_p = l2_dist.forward(out_a, out_p)
+#         d_n = l2_dist.forward(out_a, out_n)
+#         all = (d_n - d_p < args.margin).cpu().data.numpy().flatten()
+#         hard_triplets = np.where(all == 1)
+#         if len(hard_triplets[0]) == 0:
+#             continue
+#         out_selected_a = torch.from_numpy(out_a.cpu().data.numpy()[hard_triplets]).to(device)
+#         out_selected_p = torch.from_numpy(out_p.cpu().data.numpy()[hard_triplets]).to(device)
+#         out_selected_n = torch.from_numpy(out_n.cpu().data.numpy()[hard_triplets]).to(device)
+#
+#         selected_data_a = torch.from_numpy(data_a.cpu().data.numpy()[hard_triplets]).to(device)
+#         selected_data_p = torch.from_numpy(data_p.cpu().data.numpy()[hard_triplets]).to(device)
+#         selected_data_n = torch.from_numpy(data_n.cpu().data.numpy()[hard_triplets]).to(device)
+#
+#         selected_label_p = torch.from_numpy(label_p.cpu().numpy()[hard_triplets])
+#         selected_label_n= torch.from_numpy(label_n.cpu().numpy()[hard_triplets])
+#         triplet_loss = TripletMarginLoss(args.margin).forward(out_selected_a, out_selected_p, out_selected_n)
+#
+#         cls_a = model.forward_classifier(selected_data_a)
+#         cls_p = model.forward_classifier(selected_data_p)
+#         cls_n = model.forward_classifier(selected_data_n)
+#
+#         criterion = nn.CrossEntropyLoss()
+#         predicted_labels = torch.cat([cls_a,cls_p,cls_n])
+#         true_labels = torch.cat([selected_label_p.to(device),selected_label_p.to(device),selected_label_n.to(device)])
+#
+#         cross_entropy_loss = criterion(predicted_labels.to(device),true_labels.to(device))
+#
+#         loss = cross_entropy_loss + triplet_loss
+#         # compute gradient and update weights
+#         optimizer.zero_grad()
+#         loss.backward()
+#         optimizer.step()
+#
+#         # update the optimizer learning rate
+#         adjust_learning_rate(optimizer)
+#
+#         # log loss value
+#         logger.log_value('triplet_loss', triplet_loss.data).step()
+#         logger.log_value('cross_entropy_loss', cross_entropy_loss.data).step()
+#         logger.log_value('total_loss', loss.data).step()
+#         if batch_idx % args.log_interval == 0:
+#             pbar.set_description(
+#                 'Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f} \t # of Selected Triplets: {}'.format(
+#                     epoch + 1, batch_idx * len(data_a), len(train_loader.dataset),
+#                     100. * batch_idx / len(train_loader),
+#                     loss.data,len(hard_triplets[0])))
+#
+#
+#         dists = l2_dist.forward(out_selected_a,out_selected_n) #torch.sqrt(torch.sum((out_a - out_n) ** 2, 1))  # euclidean distance
+#         distances.append(dists.data.cpu().numpy())
+#         labels.append(np.zeros(dists.size(0)))
+#
+#
+#         dists = l2_dist.forward(out_selected_a,out_selected_p)#torch.sqrt(torch.sum((out_a - out_p) ** 2, 1))  # euclidean distance
+#         distances.append(dists.data.cpu().numpy())
+#         labels.append(np.ones(dists.size(0)))
+#
+#     labels = np.array([sublabel for label in labels for sublabel in label])
+#     distances = np.array([subdist for dist in distances for subdist in dist])
+#
+#     tpr, fpr, accuracy, val, val_std, far = evaluate(distances,labels)
+#     print('\33[91mTrain set: Accuracy: {:.8f}\n\33[0m'.format(np.mean(accuracy)))
+#     logger.log_value('Train Accuracy', np.mean(accuracy))
+#
+#     plot_roc(fpr,tpr,figure_name="roc_train_epoch_{}.png".format(epoch))
+#
+#     # do checkpointing
+#     torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict()},
+#                '{}/checkpoint_{}.pth'.format(LOG_DIR, epoch))
 
 def plot_roc(fpr,tpr,figure_name="roc.png"):
     import matplotlib.pyplot as plt

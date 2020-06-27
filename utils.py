@@ -34,25 +34,22 @@ def display_triplet_distance(model,train_loader,name):
 
         try:
             data_a_c, data_p_c,data_n_c = data_a.cuda(), data_p.cuda(), data_n.cuda()
-            data_a_v, data_p_v, data_n_v = Variable(data_a_c, volatile=True), \
-                                    Variable(data_p_c, volatile=True), \
-                                    Variable(data_n_c, volatile=True)
-
-            out_a, out_p, out_n = model(data_a_v), model(data_p_v), model(data_n_v)
+            with torch.no_grad():
+                out_a, out_p, out_n = model(data_a_c), model(data_p_c), model(data_n_c)
         except Exception as ex:
             print(ex)
             print("ERROR at: {}".format(batch_idx))
             break
 
-        print("Distance (anchor-positive): {}".format(l2_dist.forward(out_a,out_p).data[0][0]))
-        print("Distance (anchor-negative): {}".format(l2_dist.forward(out_a,out_n).data[0][0]))
+        print("Distance (anchor-positive): {}".format(l2_dist.forward(out_a,out_p).data))
+        print("Distance (anchor-negative): {}".format(l2_dist.forward(out_a,out_n).data))
 
 
         axarr[0].imshow(denormalize(data_a[0]))
         axarr[1].imshow(denormalize(data_p[0]))
         axarr[2].imshow(denormalize(data_n[0]))
-        axarr[0].set_title("Distance (anchor-positive): {}".format(l2_dist.forward(out_a,out_p).data[0][0]))
-        axarr[2].set_title("Distance (anchor-negative): {}".format(l2_dist.forward(out_a,out_n).data[0][0]))
+        axarr[0].set_title("Distance (anchor-positive): {}".format(l2_dist.forward(out_a,out_p).data))
+        axarr[2].set_title("Distance (anchor-negative): {}".format(l2_dist.forward(out_a,out_n).data))
 
         break
     f.savefig("{}.png".format(name))
